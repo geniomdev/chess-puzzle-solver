@@ -8,15 +8,15 @@ const DEFAULT_ENGINE: &str = "stockfish";
 const DEFAULT_DATABASE_PATH: &str = "data/lichess_db_puzzle.csv";
 const DEFAULT_SEARCH_DEPTH: u8 = 16;
 const DEFAULT_PUZZLE_COUNT: usize = 100;
+const USAGE: &str = "usage: cps [--engine \"COMMAND [ARGUMENTS]\"] [--database PATH] [--depth PLIES] [--count NUMBER] [--show-failed]";
 
 struct Puzzle {
-    #[allow(dead_code)]
     id: String,
     fen: String,
     opponent_move: String,
     solution: Vec<String>,
-    #[allow(dead_code)]
     rating: u32,
+    url: String,
 }
 
 struct Settings {
@@ -24,6 +24,7 @@ struct Settings {
     database_path: PathBuf,
     search_depth: u8,
     puzzle_count: usize,
+    show_failed: bool,
 }
 
 impl Default for Settings {
@@ -33,8 +34,73 @@ impl Default for Settings {
             database_path: PathBuf::from(DEFAULT_DATABASE_PATH),
             search_depth: DEFAULT_SEARCH_DEPTH,
             puzzle_count: DEFAULT_PUZZLE_COUNT,
+            show_failed: false,
         }
     }
+}
+
+fn parse_settings(arguments: impl IntoIterator<Item = String>) -> io::Result<Settings> {
+    fn value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> io::Result<String> {
+        arguments.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{flag} needs a value\n{USAGE}"),
+            )
+        })
+    }
+
+    fn number<T: std::str::FromStr>(text: &str, flag: &str) -> io::Result<T> {
+        text.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{flag} needs a number, not `{text}`\n{USAGE}"),
+            )
+        })
+    }
+
+    fn out_of_range(flag: &str, expectation: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} needs {expectation}\n{USAGE}"),
+        )
+    }
+
+    let mut settings = Settings::default();
+    let mut arguments = arguments.into_iter();
+
+    while let Some(flag) = arguments.next() {
+        match flag.as_str() {
+            "--engine" => {
+                settings.engine = value(&mut arguments, &flag)?;
+                if settings.engine.split_whitespace().next().is_none() {
+                    return Err(out_of_range(&flag, "a command"));
+                }
+            }
+            "--database" => settings.database_path = PathBuf::from(value(&mut arguments, &flag)?),
+            "--depth" => {
+                let plies: u32 = number(&value(&mut arguments, &flag)?, &flag)?;
+                settings.search_depth = u8::try_from(plies)
+                    .map_err(|_| out_of_range(&flag, "a depth between 1 and 255 plies"))?;
+            }
+            "--count" => settings.puzzle_count = number(&value(&mut arguments, &flag)?, &flag)?,
+            "--show-failed" => settings.show_failed = true,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown flag `{flag}`\n{USAGE}"),
+                ));
+            }
+        }
+    }
+
+    if settings.search_depth == 0 {
+        return Err(out_of_range("--depth", "a depth between 1 and 255 plies"));
+    }
+    if settings.puzzle_count == 0 {
+        return Err(out_of_range("--count", "at least one puzzle"));
+    }
+
+    Ok(settings)
 }
 
 struct Engine {
@@ -45,12 +111,18 @@ struct Engine {
 
 impl Engine {
     fn start(command: &str) -> io::Result<Self> {
-        let mut process = Command::new(command)
+        let mut words = command.split_whitespace();
+        let program = words.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "--engine needs a command")
+        })?;
+
+        let mut process = Command::new(program)
+            .args(words)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| io::Error::new(error.kind(), format!("{command}: {error}")))?;
+            .map_err(|error| io::Error::new(error.kind(), format!("{program}: {error}")))?;
 
         let input = process
             .stdin
@@ -137,6 +209,8 @@ fn parse_puzzle(line: &str) -> Option<Puzzle> {
     let mut moves = fields.next()?.split_whitespace();
     let rating = fields.next()?.parse().ok()?;
 
+    let url = fields.nth(4).unwrap_or_default();
+
     let opponent_move = moves.next()?.to_string();
     let solution: Vec<String> = moves.map(str::to_string).collect();
     if solution.is_empty() {
@@ -149,6 +223,7 @@ fn parse_puzzle(line: &str) -> Option<Puzzle> {
         opponent_move,
         solution,
         rating,
+        url: url.to_string(),
     })
 }
 
@@ -185,6 +260,7 @@ fn read_puzzles(settings: &Settings) -> io::Result<Vec<Puzzle>> {
 fn solve_puzzles(settings: &Settings, puzzles: &[Puzzle]) -> io::Result<()> {
     let mut engine = Engine::start(&settings.engine)?;
     let mut solved = 0;
+    let mut failed = Vec::new();
     let started = Instant::now();
 
     for (index, puzzle) in puzzles.iter().enumerate() {
@@ -199,27 +275,56 @@ fn solve_puzzles(settings: &Settings, puzzles: &[Puzzle]) -> io::Result<()> {
         if played == *expected {
             solved += 1;
         } else {
-            moves.push(played);
+            moves.push(played.clone());
             if engine.is_checkmate(&puzzle.fen, &moves)? {
                 solved += 1;
+            } else {
+                failed.push((puzzle, played));
             }
         }
 
         let tested = index + 1;
-        print!(
-            "\rsolved {solved} of {tested} ({:.1}%) in {:.1}s",
+        let progress = format!(
+            "solved {solved} of {tested} ({:.1}%) in {:.1}s",
             100.0 * solved as f64 / tested as f64,
             started.elapsed().as_secs_f64()
         );
+        print!("\r{progress:<48}");
         io::stdout().flush()?;
     }
     println!();
+
+    if settings.show_failed {
+        for (puzzle, played) in failed {
+            println!(
+                "{} | {:>4} | played {played} | {} {} | {}",
+                puzzle.id,
+                puzzle.rating,
+                puzzle.opponent_move,
+                puzzle.solution.join(" "),
+                puzzle.url
+            );
+        }
+    }
 
     engine.quit()
 }
 
 fn main() -> ExitCode {
-    let settings = Settings::default();
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--help") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+
+    let settings = match parse_settings(arguments) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("cps: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let puzzles = match read_puzzles(&settings) {
         Ok(puzzles) => puzzles,
         Err(error) => {
@@ -252,6 +357,10 @@ mod tests {
     const HEADER_LINE: &str =
         "PuzzleId,FEN,Moves,Rating,RatingDeviation,Popularity,NbPlays,Themes,GameUrl,OpeningTags";
 
+    fn flags(arguments: &[&str]) -> io::Result<Settings> {
+        parse_settings(arguments.iter().map(ToString::to_string))
+    }
+
     fn database(name: &str, contents: &str) -> Settings {
         let path = std::env::temp_dir().join(format!("cps-{name}.csv"));
         fs::write(&path, contents).unwrap();
@@ -265,13 +374,10 @@ mod tests {
 
     #[cfg(unix)]
     fn script(name: &str, answers: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = std::env::temp_dir().join(format!("cps-{name}.sh"));
         fs::write(&path, answers).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 
-        path.display().to_string()
+        format!("sh {}", path.display())
     }
 
     #[test]
@@ -286,6 +392,90 @@ mod tests {
         assert_eq!(puzzle.rating, 1784);
         assert_eq!(puzzle.opponent_move, "f2g3");
         assert_eq!(puzzle.solution, ["e6e7", "b2b1"]);
+        assert_eq!(puzzle.url, "https://lichess.org/787zsVup/black#48");
+    }
+
+    #[test]
+    fn keeps_defaults_without_flags() {
+        let settings = flags(&[]).unwrap();
+
+        assert_eq!(settings.engine, "stockfish");
+        assert_eq!(settings.database_path, PathBuf::from(DEFAULT_DATABASE_PATH));
+        assert_eq!(settings.search_depth, 16);
+        assert_eq!(settings.puzzle_count, 100);
+        assert!(!settings.show_failed);
+    }
+
+    #[test]
+    fn takes_every_flag() {
+        let settings = flags(&[
+            "--engine",
+            "lc0",
+            "--database",
+            "puzzles.csv",
+            "--depth",
+            "8",
+            "--count",
+            "3",
+            "--show-failed",
+        ])
+        .unwrap();
+
+        assert_eq!(settings.engine, "lc0");
+        assert_eq!(settings.database_path, PathBuf::from("puzzles.csv"));
+        assert_eq!(settings.search_depth, 8);
+        assert_eq!(settings.puzzle_count, 3);
+        assert!(settings.show_failed);
+    }
+
+    #[test]
+    fn rejects_unknown_flag() {
+        let error = flags(&["--wat"]).err().unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("unknown flag `--wat`"));
+    }
+
+    #[test]
+    fn rejects_flag_without_value() {
+        let error = flags(&["--depth"]).err().unwrap();
+
+        assert!(error.to_string().contains("--depth needs a value"));
+    }
+
+    #[test]
+    fn rejects_depth_outside_the_uci_range() {
+        for depth in ["0", "256"] {
+            let error = flags(&["--depth", depth]).err().unwrap();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("--depth needs a depth between 1 and 255 plies")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_run() {
+        let error = flags(&["--count", "0"]).err().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--count needs at least one puzzle")
+        );
+    }
+
+    #[test]
+    fn rejects_value_that_is_not_a_number() {
+        let error = flags(&["--count", "many"]).err().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--count needs a number, not `many`")
+        );
     }
 
     #[test]
@@ -372,6 +562,41 @@ while read -r command; do
     esac
 done
 "#;
+
+    #[cfg(unix)]
+    const ENGINE_NEEDING_ARGUMENTS: &str = r#"#!/bin/sh
+[ "$1" = "--uci" ] || exit 1
+while read -r command; do
+    case "$command" in
+    uci) echo uciok ;;
+    isready) echo readyok ;;
+    quit) exit 0 ;;
+    esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn passes_arguments_to_the_engine() {
+        let command = script("arguments", ENGINE_NEEDING_ARGUMENTS);
+
+        Engine::start(&format!("{command} --uci"))
+            .unwrap()
+            .quit()
+            .unwrap();
+        assert!(Engine::start(&command).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_engine_command() {
+        for error in [
+            flags(&["--engine", "   "]).err().unwrap(),
+            Engine::start("   ").err().unwrap(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("--engine needs a command"));
+        }
+    }
 
     #[cfg(unix)]
     #[test]

@@ -39,3 +39,28 @@ asked about — the solution starts from the second move.
 ```sh
 cargo run --release
 ```
+
+Every flag is optional and falls back to its default:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--engine "COMMAND [ARGUMENTS]"` | `stockfish` | UCI engine to run, with arguments if it needs any |
+| `--database PATH` | `data/lichess_db_puzzle.csv` | puzzle database to read |
+| `--depth PLIES` | `16` | search depth per puzzle |
+| `--count NUMBER` | `100` | how many puzzles to test |
+| `--show-failed` | off | list unsolved puzzles after the run |
+
+The engine gets `ucinewgame` before every puzzle, so puzzles do not warm the hash
+for each other. A puzzle counts as solved when the engine plays the recorded move,
+or when it plays a different move that is also checkmate.
+
+```sh
+cps --engine stockfish --depth 20 --count 500 --show-failed
+```
+
+Unsolved puzzles are listed as id, rating, the move the engine played, the moves
+recorded in the database and the game link:
+
+```
+000VW | 2869 | played h5g5 | g6f5 d5c5 c2e4 h5g5 g7h8 g5f6 | https://lichess.org/e9AY2m5j/black#50
+```
